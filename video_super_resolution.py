@@ -186,7 +186,7 @@ def main():
         processed += 1
         if processed % 100 == 0:
             ep_time = time.time() - segment_start_time
-            print( f"Processed frame: {processed} current speed: {100/ep_time} fps")
+            print( f"Processed frame: {processed} current speed: {100/ep_time:.2f} fps")
             segment_start_time = time.time()
 
     for packet in video_stream.encode(None):
