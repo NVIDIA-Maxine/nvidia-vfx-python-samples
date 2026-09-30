@@ -26,12 +26,22 @@ from fractions import Fraction
 from pathlib import Path
 
 import av
-import numpy as np
 import torch
 
 from nvvfx import VideoSuperRes
+from video_io_utils import (
+    avframe_to_vfx_tensor,
+    codec_candidates_for_bit_depth,
+    copy_color_metadata,
+    print_video_info,
+    resolve_bit_depth,
+    stream_fps,
+    stream_pix_fmt,
+    vfx_tensor_to_avframe,
+)
 
 HEVC_MAX = 8192
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -66,14 +76,13 @@ def parse_args():
         default="HIGH",
         help="Super resolution quality level",
     )
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=1.0,
+        help="Effect strength in [0.0, 1.0]",
+    )
     return parser.parse_args()
-
-
-def avframe_to_rgb_float(frame: av.VideoFrame, gpu: int) -> torch.Tensor:
-    arr = frame.to_ndarray(format="rgb24")
-    tensor = torch.from_numpy(arr).to(f"cuda:{gpu}")  # (H, W, 3) uint8
-    tensor = tensor.permute(2, 0, 1).float() / 255.0  # (3, H, W) float32
-    return tensor.contiguous()
 
 
 def main():
@@ -88,6 +97,9 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     quality = VideoSuperRes.QualityLevel[args.quality]
+    if not 0.0 <= args.strength <= 1.0:
+        print(f"Error: --strength must be in [0.0, 1.0], got {args.strength}")
+        sys.exit(1)
 
     gpu = 0
     stream_ptr = torch.cuda.current_stream().cuda_stream
@@ -100,6 +112,7 @@ def main():
     print(f"  Output:  {output_path}")
     print(f"  Scale:   {args.scale}x")
     print(f"  Quality: {args.quality}")
+    print(f"  Strength: {args.strength}")
     print()
 
     torch.cuda.set_device(gpu)
@@ -107,23 +120,38 @@ def main():
     input_container = av.open(str(input_path))
     input_stream = input_container.streams.video[0]
     input_stream.thread_type = "AUTO"
+    input_pix_fmt = stream_pix_fmt(input_stream)
+    bit_depth = resolve_bit_depth(input_pix_fmt)
 
     input_width = input_stream.codec_context.width
     input_height = input_stream.codec_context.height
     total_frames = input_stream.frames or 0
-    fps = float(input_stream.average_rate) if input_stream.average_rate else 0.0
+    fps = stream_fps(input_stream)
 
     output_width = input_width * args.scale
     output_height = input_height * args.scale
 
-    print("Video info:")
-    print(f"  Resolution: {input_width}x{input_height} -> {output_width}x{output_height}")
-    if total_frames:
-        print(f"  Frames:     {total_frames}")
-    print(f"  FPS:        {fps:.2f}")
+    print_video_info(
+        "Video info",
+        input_stream,
+        frames=total_frames,
+        format_label="Input format",
+    )
+    print()
+    print(f"Output resolution: {output_width}x{output_height}")
     print()
 
-    sr = VideoSuperRes(device=gpu, quality=quality)
+    image_encoding = (
+        VideoSuperRes.ImageEncoding.RGB10A2
+        if bit_depth == 10
+        else VideoSuperRes.ImageEncoding.RGB8
+    )
+    sr = VideoSuperRes(
+        device=gpu,
+        quality=quality,
+        strength=args.strength,
+        image_encoding=image_encoding,
+    )
     sr.input_width = input_width
     sr.input_height = input_height
     sr.output_width = output_width
@@ -133,34 +161,45 @@ def main():
     print()
 
     if output_height > HEVC_MAX or output_width > HEVC_MAX:
-        raise Exception(f"Output resolution exceeds the HEVC maximum resolution of {HEVC_MAX}x{HEVC_MAX}")
+        raise Exception(
+            f"Output resolution exceeds the HEVC maximum resolution of {HEVC_MAX}x{HEVC_MAX}"
+        )
 
     frame_rate = Fraction(fps if fps else 30).limit_denominator(10000)
 
     # Pick video codec: prefer HW (hevc_nvenc), fall back to SW (libx265).
-    codec_candidates = ("hevc_nvenc", "libx265")
+    codec_candidates = codec_candidates_for_bit_depth(bit_depth)
     output_container = None
     video_stream = None
-    for name in codec_candidates:
+    for name, pix_fmt in codec_candidates:
         container = av.open(str(output_path), mode="w")
         try:
             stream = container.add_stream(name, rate=frame_rate)
             stream.width = output_width
             stream.height = output_height
-            stream.pix_fmt = "yuv420p"
+            stream.pix_fmt = pix_fmt
             stream.bit_rate = bitrate
+            copy_color_metadata(input_stream.codec_context, stream.codec_context)
+            if name == "libx265":
+                stream.options = {"x265-params": "log-level=error"}
             stream.codec_context.open()
         except Exception:
             container.close()
             continue
-        output_container, video_stream, codec_name = container, stream, name
+        output_container, video_stream, codec_name, output_pix_fmt = (
+            container,
+            stream,
+            name,
+            pix_fmt,
+        )
         break
 
     if video_stream is None:
-        print(f"Error: no usable H.265 encoder (tried {', '.join(codec_candidates)})")
+        tried = ", ".join(f"{name}/{pix_fmt}" for name, pix_fmt in codec_candidates)
+        print(f"Error: no usable H.265 encoder (tried {tried})")
         sys.exit(1)
 
-    print(f"Encoder: {codec_name}")
+    print(f"Encoder: {codec_name} ({output_pix_fmt})")
 
     if total_frames:
         print(f"Processing {total_frames} frames...")
@@ -169,26 +208,38 @@ def main():
     start_time = time.time()
 
     processed = 0
-    for frame in input_container.decode(input_stream):
-        rgb_input = avframe_to_rgb_float(frame, gpu)
+    try:
+        for frame in input_container.decode(input_stream):
+            rgb_input = avframe_to_vfx_tensor(frame, gpu, bit_depth)
+            if bit_depth == 10 and len(rgb_input.shape) != 2:
+                raise RuntimeError(f"10-bit VSR input packing failed: expected (H, W), got {tuple(rgb_input.shape)}")
 
-        torch.cuda.nvtx.range_push("VideoSuperRes")
-        output = sr.run(rgb_input, stream_ptr=stream_ptr)
-        rgb_output = torch.from_dlpack(output.image).clone()
-        torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_push("VideoSuperRes")
+            output = sr.run(rgb_input, stream_ptr=stream_ptr)
+            rgb_output = torch.from_dlpack(output.image).clone()
+            torch.cuda.nvtx.range_pop()
 
-        frame_np = (
-            (rgb_output.clamp(0.0, 1.0) * 255.0).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-        )
-        out_frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
-        for packet in video_stream.encode(out_frame):
+            out_frame = vfx_tensor_to_avframe(rgb_output, bit_depth)
+            copy_color_metadata(input_stream.codec_context, out_frame)
+            for packet in video_stream.encode(out_frame):
+                output_container.mux(packet)
+            processed += 1
+
+        for packet in video_stream.encode(None):
             output_container.mux(packet)
-        processed += 1
+    finally:
+        if output_container is not None:
+            output_container.close()
+        input_container.close()
+        sr.close()
 
-    for packet in video_stream.encode(None):
-        output_container.mux(packet)
-    output_container.close()
-    input_container.close()
+    print()
+    print_video_info(
+        "Output video info",
+        output_path,
+        frames=processed,
+        format_label="Output format",
+    )
 
     elapsed = time.time() - start_time
     fps_proc = processed / elapsed if elapsed > 0 else 0

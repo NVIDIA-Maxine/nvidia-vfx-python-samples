@@ -1,5 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cu128
 av
 numpy
-torch
-nvidia-vfx==0.1.0.1
+torch==2.11.0+cu128
+nvidia-vfx==0.2.0.0

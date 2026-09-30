@@ -1,0 +1,5 @@
+--extra-index-url https://pypi.nvidia.com/nvtorch_oot
+av
+numpy
+torch==2.14.0+cu134 ; python_version >= "3.11" and python_version < "3.15"
+nvidia-vfx==0.2.0.0
